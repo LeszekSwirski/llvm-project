@@ -2754,15 +2754,29 @@ bool LoopAccessInfo::analyzeLoop(AAResults *AA, const LoopInfo *LI,
     // read list. If we *did* see it before, then it is already in
     // the read-write list. This allows us to vectorize expressions
     // such as A[i] += x;  Because the address of A[i] is a read-write
-    // pointer. This only works if the index of A[i] is consecutive.
-    // If the address of i is unknown (for example A[B[i]]) then we may
-    // read a few words, modify, and write a few words, and some of the
-    // words may be written to the same address.
+    // pointer. This only works if the index of A[i] is strictly monotonic. We
+    // approximate (conservatively) that by checking for a strided access (with
+    // non-zero stride). If the address of i is unknown (for example A[B[i]])
+    // then we may read a few words, modify, and write a few words, and some of
+    // the words may be written to the same address.
     bool IsReadOnlyPtr = false;
     Type *AccessTy = getLoadStoreType(LD);
-    if (Seen.insert({Ptr, AccessTy}).second ||
-        !getPtrStride(*PSE, AccessTy, Ptr, TheLoop, *DT, SymbolicStrides, false,
-                      true)) {
+    auto IsSafeReadWrite = [&] {
+      const SCEV *Stride = getPtrStrideScev(*PSE, AccessTy, Ptr, TheLoop, *DT,
+                                            SymbolicStrides, false, true);
+      if (!Stride)
+        return false;
+
+      // Statically known invariant address, preserve old behavior for the
+      // LoopDistributePass. For LoopVectorizer we will detect a load from the
+      // uniform store pointer and bail out further below.
+      if (Stride->isZero())
+        return true;
+
+      auto *SE = PSE->getSE();
+      return SE->isKnownPositive(SE->getAbsExpr(Stride, false));
+    };
+    if (Seen.insert({Ptr, AccessTy}).second || !IsSafeReadWrite()) {
       ++NumReads;
       IsReadOnlyPtr = true;
     }
